@@ -1,237 +1,391 @@
-#!/usr/bin/env python3
 """
-Scrape Makkah Newspaper for new Nabil Alhakamy articles, in both English
-and Arabic, and update articles.json and articles_ar.json accordingly.
+Weekly scraper for Makkah Newspaper articles by Nabil Alhakamy.
 
-Sources (each language checked independently):
-  English:
-    1. https://makkahnewspaper.com/search/?query=nabil+alhakamy
-    2. https://makkahnewspaper.com/author/10950/nabil-alhakamy
-  Arabic:
-    1. https://makkahnewspaper.com/search/?query=نبيل+الحكمي
+Strategy:
+  1. Fetch the author archive page.
+  2. Extract all article links.
+  3. For each NEW link not already in either JSON file, fetch the article.
+  4. Detect language by looking for Arabic Unicode characters in the title.
+  5. English titles go to articles.json. Arabic titles go to articles_ar.json.
 
-This script is idempotent — running it when no new articles exist leaves
-both JSON files untouched. Designed to run in GitHub Actions, locally,
-or as a server cron job.
+The /search/ endpoint is currently 403 blocked, so we only use the author
+archive. The author archive returns mixed English and Arabic titles, which
+is why language detection on the title text is necessary.
+
+This script is intentionally defensive: every external operation is wrapped
+in a try/except so one bad article cannot kill the whole run.
 """
 
 import json
 import re
 import sys
-from datetime import datetime, timezone
+import time
+import traceback
+from datetime import datetime
 from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.parse import quote_plus
+from typing import List, Dict, Optional, Set
+from urllib.parse import urljoin
+
+import urllib.request
+import urllib.error
 from html.parser import HTMLParser
 
-# ---------- Config ----------
 
-SOURCES_EN = [
-    "https://makkahnewspaper.com/search/?query=nabil+alhakamy",
-    "https://makkahnewspaper.com/author/10950/nabil-alhakamy",
-]
-
-# The Arabic search URL — quote_plus encodes "نبيل الحكمي" with + for space,
-# matching the exact form Makkah Newspaper uses.
-SOURCES_AR = [
-    "https://makkahnewspaper.com/search/?query=" + quote_plus("نبيل الحكمي"),
-]
-
-ROOT = Path(__file__).parent
-EN_JSON = ROOT / "articles.json"
-AR_JSON = ROOT / "articles_ar.json"
+AUTHOR_URL = "https://makkahnewspaper.com/author/10950/nabil-alhakamy"
+ARTICLES_EN_FILE = Path("articles.json")
+ARTICLES_AR_FILE = Path("articles_ar.json")
 
 USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 "
-    "" 
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
-TIMEOUT = 25
+
+REQUEST_TIMEOUT = 25
+SLEEP_BETWEEN_REQUESTS = 1.0
 
 
-# ---------- HTTP ----------
+# ----------------------------------------------------------------------------
+# HTTP
+# ----------------------------------------------------------------------------
 
-def fetch(url: str) -> str:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(req, timeout=TIMEOUT) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+def fetch(url):
+    # type: (str) -> str
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+            "Accept-Encoding": "identity",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        raw = resp.read()
+        return raw.decode("utf-8", errors="replace")
 
 
-# ---------- Article-list parser ----------
+# ----------------------------------------------------------------------------
+# Parsers
+# ----------------------------------------------------------------------------
 
 class ArticleListParser(HTMLParser):
-    """
-    Pull (url, title) pairs out of any Makkah Newspaper listing page.
-    Article anchors look like:
-      <a href=".../article/NNNNNN/section/slug" title="Article Title">
-    """
-
     def __init__(self):
         super().__init__()
-        self.found: list[tuple[str, str]] = []
+        self.links = set()  # type: Set[str]
 
     def handle_starttag(self, tag, attrs):
         if tag != "a":
             return
-        d = dict(attrs)
-        href = d.get("href", "")
-        title = d.get("title", "").strip()
-        if (
-            href
-            and "/article/" in href
-            and title
-            and len(title) >= 4
-            and "makkahnewspaper.com" in href
-        ):
-            if not any(u == href for u, _ in self.found):
-                self.found.append((href, title))
+        href = dict(attrs).get("href", "") or ""
+        if "/article/" in href:
+            full = urljoin("https://makkahnewspaper.com/", href)
+            full = full.split("?")[0].split("#")[0]
+            self.links.add(full)
 
 
-# ---------- Date extraction ----------
+class ArticleDetailParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.title = None  # type: Optional[str]
+        self.published = None  # type: Optional[str]
+        self._capture_text_for = None  # type: Optional[str]
+        self._buffer = []  # type: List[str]
 
-def parse_article_date(article_html: str):
-    """Extract YYYY-MM-DD from a single article page. Returns None if not found."""
-    m = re.search(r'<time[^>]*datetime="(\d{4}-\d{2}-\d{2})', article_html)
-    if m:
-        return m.group(1)
-    m = re.search(
-        r'property="article:published_time"[^>]*content="(\d{4}-\d{2}-\d{2})',
-        article_html,
-    )
-    if m:
-        return m.group(1)
-    m = re.search(r'"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2})', article_html)
-    if m:
-        return m.group(1)
-    return None
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta":
+            prop = a.get("property") or a.get("name") or ""
+            content = a.get("content", "") or ""
+            if prop in ("og:title", "twitter:title") and content and not self.title:
+                self.title = content.strip()
+            if prop in (
+                "article:published_time",
+                "og:article:published_time",
+                "datePublished",
+                "publishedDate",
+            ) and content and not self.published:
+                self.published = content.strip()
+        elif tag == "title" and not self.title:
+            self._capture_text_for = "title"
+            self._buffer = []
+        elif tag == "time" and not self.published:
+            dt = a.get("datetime")
+            if dt:
+                self.published = dt.strip()
+
+    def handle_endtag(self, tag):
+        if self._capture_text_for == "title" and tag == "title":
+            text = "".join(self._buffer).strip()
+            if text and not self.title:
+                # strip site suffix
+                text = re.sub(r"\s*[\|\-–—]\s*صحيفة\s*مكة\s*$", "", text)
+                text = re.sub(r"\s*[\|\-–—]\s*Makkah.*$", "", text, flags=re.I)
+                self.title = text.strip()
+            self._capture_text_for = None
+            self._buffer = []
+
+    def handle_data(self, data):
+        if self._capture_text_for:
+            self._buffer.append(data)
 
 
-# ---------- Topic classifiers ----------
+# ----------------------------------------------------------------------------
+# Language detection (uses Unicode escape sequences for safety)
+# ----------------------------------------------------------------------------
 
-def classify_en(title: str) -> str:
-    """Bucket an English title into one of 6 topics by keyword match."""
+ARABIC_RE = re.compile(
+    "[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]"
+)
+
+
+def is_arabic(text):
+    # type: (str) -> bool
+    if not text:
+        return False
+    return len(ARABIC_RE.findall(text)) >= 3
+
+
+# ----------------------------------------------------------------------------
+# Topic classification
+# ----------------------------------------------------------------------------
+
+EN_TOPIC_KEYWORDS = {
+    "Pharmaceuticals": ["pharma", "drug", "medicine", "fda", "clinical", "saudi fda"],
+    "Biotechnology": ["biotech", "gene", "cell", "therapy", "rna", "dna", "immuno"],
+    "Saudi Arabia": ["saudi", "kingdom", "vision 2030", "kau", "riyadh", "jeddah"],
+    "Investment": ["invest", "venture", "fund", "capital", "ipo", "market"],
+    "Space & Innovation": ["space", "rocket", "satellite", "spacex", "starlink", "ast"],
+    "Science & Tech": ["ai", "artificial intelligence", "tech", "innovation", "digital"],
+}
+
+AR_TOPIC_KEYWORDS = {
+    "الصناعات الدوائية": [
+        "دواء",
+        "أدوية",
+        "صيدل",
+        "سريري",
+    ],
+    "التقنية الحيوية": [
+        "التقنية الحيوية",
+        "بيوتك",
+        "خلوي",
+        "جيني",
+    ],
+    "السعودية": [
+        "السعودية",
+        "المملكة",
+        "الرؤية",
+        "2030",
+    ],
+    "الاستثمار": [
+        "استثمار",
+        "تمويل",
+        "صندوق",
+        "سوق",
+    ],
+    "الفضاء": [
+        "فضاء",
+        "صاروخ",
+        "قمر",
+    ],
+    "العلم والتقنية": [
+        "ذكاء اصطناعي",
+        "تقنية",
+        "ابتكار",
+    ],
+}
+
+AR_DEFAULT_TOPIC = "العلم والتقنية"
+EN_DEFAULT_TOPIC = "Science & Tech"
+
+
+def classify_topic(title, language):
+    # type: (str, str) -> str
     t = title.lower()
-    if re.search(r"\b(saudi|vision\s*2030|kingdom|kau|jeddah|riyadh|gcc|arab|sfda|spimaco|tamer|neom)\b", t):
-        return "saudi"
-    if re.search(r"\b(space|rocket|satellite|apollo|mars|lunar|astronaut|spacex|starlink|orbit|cosmos|falcon)\b", t):
-        return "space"
-    if re.search(r"\b(quantum|nanorobot|nanotech|exposome|crispr|genom|precision medicine|artificial intelligence)\b", t):
-        return "science"
-    if re.search(r"\b(biotech|biotechnology|biological|biopharma)\b", t):
-        return "biotech"
-    if re.search(r"\b(invest|venture|private equity|stock|ipo|m&a|merger|acquisition|fund|trillion|billion|wealth|capital|index|xbi|firepower|pricing)\b", t):
-        return "finance"
-    if re.search(r"\b(drug|pharma|pharmaceutical|medicine|opioid|glp|painkiller|generic|compounding|prescription|fda|clinical trial)\b", t):
-        return "pharma"
-    return "pharma"
+    keymap = AR_TOPIC_KEYWORDS if language == "ar" else EN_TOPIC_KEYWORDS
+    for topic, keywords in keymap.items():
+        for kw in keywords:
+            if kw.lower() in t:
+                return topic
+    return AR_DEFAULT_TOPIC if language == "ar" else EN_DEFAULT_TOPIC
 
 
-def classify_ar(title: str) -> str:
-    """Bucket an Arabic title into one of 6 topics by keyword match."""
-    t = title
-    if re.search(r"السعودي|المملكة|رؤية\s*2030|جدة|الرياض|الخليج|سعودي|الإمارات|عبدالعزيز|نيوم|الكويت|قطر|البحرين|عربية", t):
-        return "saudi"
-    if re.search(r"الفضاء|الفضائي|الأقمار|القمر|مريخ|ناسا|سبيس|صاروخ|كواكب|مدارات|الكواكب|سبيس\s?إكس", t):
-        return "space"
-    if re.search(r"إكسبوزوم|الكوانت|الكم|النانو|الجينوم|كريسبر|الذكاء\s*الاصطناعي|الذكاء|بحث\s*علمي|اكتشاف|دقيق|التحرير\s*الجيني|الإبستجين", t):
-        return "science"
-    if re.search(r"التقنية\s*الحيوية|الحيوية|بيولوجي|الخلايا|اللقاحات|اللقاح|التصنيع\s*الحيوي|الجينات|البيولوجي|الجيني", t):
-        return "biotech"
-    if re.search(r"استثمار|الاستثمار|رأس\s*المال|صندوق|تمويل|اندماج|استحواذ|اكتتاب|أسهم|بورصة|سوق|اقتصاد|تجاري|الأرباح|مليار|قيمة|تسعير|تكلفة|الشراكة", t):
-        return "finance"
-    return "pharma"
+# ----------------------------------------------------------------------------
+# Date formatting
+# ----------------------------------------------------------------------------
+
+AR_MONTHS = [
+    "يناير",
+    "فبراير",
+    "مارس",
+    "أبريل",
+    "مايو",
+    "يونيو",
+    "يوليو",
+    "أغسطس",
+    "سبتمبر",
+    "أكتوبر",
+    "نوفمبر",
+    "ديسمبر",
+]
 
 
-# ---------- Per-language update routine ----------
-
-def gather_links(sources):
-    """Walk all source URLs and return a deduplicated list of (url, title)."""
-    seen, out = set(), []
-    for url in sources:
-        print(f"  Fetching: {url}")
-        try:
-            html = fetch(url)
-        except Exception as exc:
-            print(f"    WARN: {url} failed: {exc}", file=sys.stderr)
-            continue
-        p = ArticleListParser()
-        p.feed(html)
-        print(f"    found {len(p.found)} link(s)")
-        for href, title in p.found:
-            if href in seen:
-                continue
-            seen.add(href)
-            out.append((href, title))
-    return out
+def format_date(raw, language):
+    # type: (Optional[str], str) -> str
+    if not raw:
+        return ""
+    try:
+        cleaned = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        if language == "ar":
+            return "{} {}".format(AR_MONTHS[dt.month - 1], dt.year)
+        return dt.strftime("%B %Y")
+    except Exception:
+        return raw
 
 
-def update_one_language(label, sources, json_path, classifier):
-    """Update a single articles JSON file. Returns count of new articles, or -1 on failure."""
-    print(f"\n=== {label} ===")
-    candidates = gather_links(sources)
-    print(f"  Total unique candidate links: {len(candidates)}")
+# ----------------------------------------------------------------------------
+# Persistence
+# ----------------------------------------------------------------------------
 
-    if not candidates:
-        print(f"  ERROR: zero links extracted for {label}.", file=sys.stderr)
-        return -1
+def load_json(path):
+    # type: (Path) -> List[Dict]
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
 
-    existing = []
-    if json_path.exists():
-        existing = json.loads(json_path.read_text(encoding="utf-8"))
-    existing_urls = {a["url"] for a in existing}
 
-    new_articles = []
-    for url, title in candidates:
-        if url in existing_urls:
-            continue
-        try:
-            article_html = fetch(url)
-            date_iso = parse_article_date(article_html)
-        except Exception as exc:
-            print(f"  Skipping {url}: {exc}", file=sys.stderr)
-            continue
-        if not date_iso:
-            print(f"  No date found for {url}, using today", file=sys.stderr)
-            date_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        new_articles.append({
-            "title": title,
-            "date_iso": date_iso,
-            "url": url,
-            "topic": classifier(title),
-        })
-        print(f"  NEW: {date_iso}  [{classifier(title):8s}]  {title[:60]}")
-
-    if not new_articles:
-        print(f"  No new {label} articles.")
-        return 0
-
-    all_articles = new_articles + existing
-    all_articles.sort(key=lambda a: a["date_iso"], reverse=True)
-    json_path.write_text(
-        json.dumps(all_articles, indent=2, ensure_ascii=False),
+def save_json(path, data):
+    # type: (Path, List[Dict]) -> None
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"  Added {len(new_articles)} new {label} article(s). Total: {len(all_articles)}")
-    return len(new_articles)
 
 
-# ---------- Entry point ----------
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
 
 def main():
-    print("Scraping Makkah Newspaper for new Nabil Alhakamy articles...")
-    print(f"Run timestamp (UTC): {datetime.now(timezone.utc).isoformat()}")
+    print("=== Makkah scraper ===")
+    print("Fetching author archive: {}".format(AUTHOR_URL))
 
-    en_added = update_one_language("English", SOURCES_EN, EN_JSON, classify_en)
-    ar_added = update_one_language("Arabic",  SOURCES_AR, AR_JSON, classify_ar)
-
-    if en_added == -1 and ar_added == -1:
-        print("\nERROR: both EN and AR sources returned zero links. Page structure may have changed.",
-              file=sys.stderr)
+    try:
+        html = fetch(AUTHOR_URL)
+    except Exception as e:
+        print("ERROR fetching author archive: {}".format(e), file=sys.stderr)
+        traceback.print_exc()
         return 1
 
-    total_new = max(0, en_added) + max(0, ar_added)
-    print(f"\nDone. {total_new} total new article(s) across both languages.")
+    list_parser = ArticleListParser()
+    try:
+        list_parser.feed(html)
+    except Exception as e:
+        print("ERROR parsing author archive: {}".format(e), file=sys.stderr)
+        traceback.print_exc()
+        return 1
+
+    links = sorted(list_parser.links)
+    print("  found {} link(s) on author archive".format(len(links)))
+
+    if not links:
+        print("WARN: zero article links extracted. Author archive structure may have changed.",
+              file=sys.stderr)
+        # Don't fail the workflow on this; return success so existing files are preserved.
+        return 0
+
+    existing_en = load_json(ARTICLES_EN_FILE)
+    existing_ar = load_json(ARTICLES_AR_FILE)
+    print("  existing English articles: {}".format(len(existing_en)))
+    print("  existing Arabic articles:  {}".format(len(existing_ar)))
+
+    existing_urls = set()
+    for a in existing_en + existing_ar:
+        if isinstance(a, dict):
+            u = a.get("url")
+            if u:
+                existing_urls.add(u)
+
+    new_links = [u for u in links if u not in existing_urls]
+    print("  {} new link(s) not yet in either JSON file".format(len(new_links)))
+
+    if not new_links:
+        print("No new articles. Nothing to commit.")
+        return 0
+
+    new_en = []  # type: List[Dict]
+    new_ar = []  # type: List[Dict]
+
+    for url in new_links:
+        print("  Fetching: {}".format(url))
+        try:
+            page = fetch(url)
+        except Exception as e:
+            print("    skip (fetch error): {}".format(e), file=sys.stderr)
+            continue
+
+        detail = ArticleDetailParser()
+        try:
+            detail.feed(page)
+        except Exception as e:
+            print("    skip (parse error): {}".format(e), file=sys.stderr)
+            continue
+
+        title = (detail.title or "").strip()
+        if not title:
+            print("    skip: no title found", file=sys.stderr)
+            continue
+
+        language = "ar" if is_arabic(title) else "en"
+        try:
+            topic = classify_topic(title, language)
+            date_str = format_date(detail.published, language)
+        except Exception as e:
+            print("    classify/date error: {}".format(e), file=sys.stderr)
+            topic = AR_DEFAULT_TOPIC if language == "ar" else EN_DEFAULT_TOPIC
+            date_str = detail.published or ""
+
+        entry = {
+            "title": title,
+            "url": url,
+            "date": date_str,
+            "topic": topic,
+        }
+
+        if language == "ar":
+            new_ar.append(entry)
+            print("    AR: {}".format(title[:80]))
+        else:
+            new_en.append(entry)
+            print("    EN: {}".format(title[:80]))
+
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    if new_en:
+        save_json(ARTICLES_EN_FILE, new_en + existing_en)
+        print("Wrote {} new English article(s) to {}".format(len(new_en), ARTICLES_EN_FILE))
+
+    if new_ar:
+        save_json(ARTICLES_AR_FILE, new_ar + existing_ar)
+        print("Wrote {} new Arabic article(s) to {}".format(len(new_ar), ARTICLES_AR_FILE))
+
+    if not new_en and not new_ar:
+        print("All new links yielded no usable articles.")
+
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
