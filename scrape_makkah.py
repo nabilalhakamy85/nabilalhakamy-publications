@@ -42,8 +42,8 @@ EN_JSON = ROOT / "articles.json"
 AR_JSON = ROOT / "articles_ar.json"
 
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; AlhakamyArchiveBot/1.0; "
-    "+https://github.com/USERNAME/REPO)"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 "
+    "" 
 )
 TIMEOUT = 25
 
